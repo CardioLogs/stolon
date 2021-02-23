@@ -48,10 +48,11 @@ var CmdProxy = &cobra.Command{
 type config struct {
 	cmd.CommonConfig
 
-	listenAddress string
-	port          string
-	stopListening bool
-	debug         bool
+	listenAddress      string
+	port               string
+	stopListening      bool
+	synchronousReplica bool
+	debug              bool
 
 	keepAliveIdle     int
 	keepAliveCount    int
@@ -66,6 +67,7 @@ func init() {
 	CmdProxy.PersistentFlags().StringVar(&cfg.listenAddress, "listen-address", "127.0.0.1", "proxy listening address")
 	CmdProxy.PersistentFlags().StringVar(&cfg.port, "port", "5432", "proxy listening port")
 	CmdProxy.PersistentFlags().BoolVar(&cfg.stopListening, "stop-listening", true, "stop listening on store error")
+	CmdProxy.PersistentFlags().BoolVar(&cfg.synchronousReplica, "synchronous-replica", false, "proxy to synchronous replica only, not master")
 	CmdProxy.PersistentFlags().BoolVar(&cfg.debug, "debug", false, "enable debug logging")
 	CmdProxy.PersistentFlags().IntVar(&cfg.keepAliveIdle, "tcp-keepalive-idle", 0, "set tcp keepalive idle (seconds)")
 	CmdProxy.PersistentFlags().IntVar(&cfg.keepAliveCount, "tcp-keepalive-count", 0, "set tcp keepalive probe count number")
@@ -81,7 +83,8 @@ type ClusterChecker struct {
 	listenAddress string
 	port          string
 
-	stopListening bool
+	stopListening      bool
+	synchronousReplica bool
 
 	listener         *net.TCPListener
 	pp               *pollon.Proxy
@@ -102,12 +105,13 @@ func NewClusterChecker(uid string, cfg config) (*ClusterChecker, error) {
 	}
 
 	return &ClusterChecker{
-		uid:              uid,
-		listenAddress:    cfg.listenAddress,
-		port:             cfg.port,
-		stopListening:    cfg.stopListening,
-		e:                e,
-		endPollonProxyCh: make(chan error),
+		uid:                uid,
+		listenAddress:      cfg.listenAddress,
+		port:               cfg.port,
+		stopListening:      cfg.stopListening,
+		synchronousReplica: cfg.synchronousReplica,
+		e:                  e,
+		endPollonProxyCh:   make(chan error),
 
 		proxyCheckInterval: cluster.DefaultProxyCheckInterval,
 		proxyTimeout:       cluster.DefaultProxyTimeout,
@@ -200,7 +204,7 @@ func (c *ClusterChecker) Check() error {
 
 	log.Debugf("cd dump: %s", spew.Sdump(cd))
 	if cd == nil {
-		log.Infow("no clusterdata available, closing connections to master")
+		log.Infow("no clusterdata available, closing connections to target")
 		c.sendPollonConfData(pollon.ConfData{DestAddr: nil})
 		return nil
 	}
@@ -227,7 +231,7 @@ func (c *ClusterChecker) Check() error {
 
 	proxy := cd.Proxy
 	if proxy == nil {
-		log.Infow("no proxy object available, closing connections to master")
+		log.Infow("no proxy object available, closing connections to target")
 		c.sendPollonConfData(pollon.ConfData{DestAddr: nil})
 		// ignore errors on setting proxy info
 		if err = c.SetProxyInfo(c.e, cluster.NoGeneration, proxyTimeout); err != nil {
@@ -242,9 +246,21 @@ func (c *ClusterChecker) Check() error {
 		return nil
 	}
 
+	// Use the master database...
 	db, ok := cd.DBs[proxy.Spec.MasterDBUID]
+
+	// ...unless we've specified we want to proxy to a sync replica
+	if c.synchronousReplica {
+		if len(db.Status.SynchronousStandbys) > 0 {
+			db, ok = cd.DBs[db.Status.SynchronousStandbys[0]]
+		} else {
+			log.Infow("no replica found, connection to master")
+		}
+	}
+
+
 	if !ok {
-		log.Infow("no db object available, closing connections to master", "db", proxy.Spec.MasterDBUID)
+		log.Infow("no db object available, closing connections")
 		c.sendPollonConfData(pollon.ConfData{DestAddr: nil})
 		// ignore errors on setting proxy info
 		if err = c.SetProxyInfo(c.e, proxy.Generation, proxyTimeout); err != nil {
@@ -265,28 +281,31 @@ func (c *ClusterChecker) Check() error {
 		c.sendPollonConfData(pollon.ConfData{DestAddr: nil})
 		return nil
 	}
-	log.Infow("master address", "address", addr)
-	if err = c.SetProxyInfo(c.e, proxy.Generation, proxyTimeout); err != nil {
-		// if we failed to update our proxy info when a master is defined we
-		// cannot ignore this error since the sentinel won't know that we exist
-		// and are sending connections to a master so, when electing a new
-		// master, it'll not wait for us to close connections to the old one.
-		return fmt.Errorf("failed to update proxyInfo: %v", err)
-	} else {
-		// update proxyCheckinterval and proxyTimeout only if we successfully updated our proxy info
-		c.configMutex.Lock()
-		c.proxyCheckInterval = cdProxyCheckInterval
-		c.proxyTimeout = cdProxyTimeout
-		c.configMutex.Unlock()
-	}
+	log.Infow("target address", "address", addr)
+	// Enforce sentinel consistency only when not proxying to replica
+	if !c.synchronousReplica {
+		if err = c.SetProxyInfo(c.e, proxy.Generation, proxyTimeout); err != nil {
+			// if we failed to update our proxy info when a target is defined
+			// cannot ignore this error since the sentinel won't know that we exist
+			// and are sending connections to a master so, when electing a new
+			// master, it'll not wait for us to close connections to the old one.
+			return fmt.Errorf("failed to update proxyInfo: %v", err)
+		} else {
+			// update proxyCheckinterval and proxyTimeout only if we successfully updated our proxy info
+			c.configMutex.Lock()
+			c.proxyCheckInterval = cdProxyCheckInterval
+			c.proxyTimeout = cdProxyTimeout
+			c.configMutex.Unlock()
+		}
+        }
 
 	// start proxing only if we are inside enabledProxies, this ensures that the
 	// sentinel has read our proxyinfo and knows we are alive
-	if util.StringInSlice(proxy.Spec.EnabledProxies, c.uid) {
-		log.Infow("proxying to master address", "address", addr)
+	if (c.synchronousReplica || util.StringInSlice(proxy.Spec.EnabledProxies, c.uid)) {
+		log.Infow("proxying to target address", "address", addr)
 		c.sendPollonConfData(pollon.ConfData{DestAddr: addr})
 	} else {
-		log.Infow("not proxying to master address since we aren't in the enabled proxies list", "address", addr)
+		log.Infow("not proxying since we aren't in the enabled proxies list", "address", addr)
 		c.sendPollonConfData(pollon.ConfData{DestAddr: nil})
 	}
 
